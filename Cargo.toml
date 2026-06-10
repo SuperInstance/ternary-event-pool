@@ -1,4 +1,6 @@
 [package]
+description = "ternary-event-pool - SuperInstance ecosystem crate"
+repository = "https://github.com/SuperInstance/ternary-event-pool"
 name = "ternary-event-pool"
 version = "0.1.0"
 edition = "2024"
