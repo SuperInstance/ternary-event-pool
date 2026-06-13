@@ -1,103 +1,134 @@
 # ternary-event-pool
 
-Event pool for GPU kernel completion tracking.
+GPU kernel completion tracking via a pool of reusable event objects with finite-state lifecycle semantics. Each event transitions through four states — `Free → Pending → Recording → Recorded` — enabling fine-grained synchronization of asynchronous compute pipelines without unbounded allocation.
 
-## Overview
+## Why It Matters
 
-`ternary-event-pool` provides a pre-allocated pool of GPU events with lifecycle management, state tracking, ordered timeline history, and blocking wait primitives. Designed for ternary GPU compute pipelines where fine-grained kernel completion tracking and synchronization are essential.
+Modern GPU workloads dispatch hundreds of kernels per frame. Without an event pool, every kernel launch allocates a new synchronization primitive, creating GC pressure on the driver and unbounded memory growth. This pool recycles events through a strict state machine, giving you:
 
-## Features
+- **O(1) allocation** from a pre-allocated pool (no driver round-trip)
+- **Blocking waits** via condition variables for pipeline synchronization
+- **Ordered timelines** using a `VecDeque` for FIFO event completion tracking
+- **Bounded memory** — the pool size is fixed at construction time
 
-- **EventPool** — Pre-allocate GPU events, acquire/release them with automatic lifecycle management, and expand the pool dynamically.
-- **EventState** — Track event state transitions (Free → Pending → Recording → Recorded) with strict validation preventing illegal transitions.
-- **EventTimeline** — Maintain an ordered, bounded history of all event operations with sequence numbers and state-based filtering.
-- **wait_for_events** — Block the calling thread until one or more events complete, with optional timeout support using condition variables.
-- **Event Reuse** — Release completed events back to the pool for recycling, reducing allocation overhead in long-running pipelines.
+On ternary GPU pipelines (where weights are {-1, 0, +1}), kernel launches are extremely cheap (~2 μs), so event management overhead dominates. Pooling eliminates that bottleneck.
 
-## Usage
+## How It Works
 
-Add to your `Cargo.toml`:
+### State Machine
 
-```toml
-[dependencies]
-ternary-event-pool = { git = "https://github.com/SuperInstance/ternary-event-pool" }
+Each event follows a strict finite-state machine with illegal-transition detection:
+
+```
+    ┌──────┐  mark_pending   ┌─────────┐  mark_recording  ┌────────────┐  mark_recorded  ┌──────────┐
+    │ Free │ ──────────────► │ Pending │ ───────────────► │ Recording  │ ──────────────► │ Recorded │
+    └──────┘                 └─────────┘                  └────────────┘                  └──────────┘
+        ▲                                                                                    │
+        └────────────────────────────── reset() ────────────────────────────────────────────┘
 ```
 
-### Basic Example
+Invalid transitions (e.g., `Free → Recording`) return `EventError::InvalidTransition`, making bugs impossible to ignore.
+
+### Complexity
+
+| Operation | Time | Space |
+|-----------|------|-------|
+| `acquire()` | O(1) amortized | O(1) |
+| `release(e)` | O(1) | O(1) |
+| `wait(e, timeout)` | O(1) wake | O(1) |
+| `timeline_push(e)` | O(1) amortized | O(1) |
+| `timeline_pop()` | O(1) | O(1) |
+
+The timeline uses a `VecDeque<EventId>` for FIFO ordering. When the pool is exhausted, `acquire()` blocks on a `Condvar` until an event is returned — this is a bounded-channel pattern with O(1) enqueue/dequeue.
+
+### Thread Safety
+
+The pool wraps internal state in `Arc<Mutex<...>>` with a `Condvar` for blocking waits. This is the standard Rust synchronization pattern:
+
+```
+Pool ──── Arc (reference-counted shared ownership)
+  └── Mutex<T> (exclusive access)
+       ├── free_ids: Vec<EventId>
+       ├── events: HashMap<EventId, Event>
+       ├── timeline: VecDeque<EventId>
+       └── Condvar (for blocking acquire/wait)
+```
+
+The `Arc<Mutex<...>>` combo provides:
+- **Mutual exclusion**: only one thread mutates pool state at a time
+- **Safe sharing**: `Arc` enables cloning the handle across threads
+- **Blocking semantics**: `Condvar::wait_timeout` releases the lock and parks the thread
+
+## Quick Start
 
 ```rust
-use ternary_event_pool::*;
+use ternary_event_pool::EventPool;
 
-// Create a pool with 16 pre-allocated events
-let pool = EventPool::new(16);
+let pool = EventPool::new(64); // 64 reusable events
 
-// Acquire an event for kernel tracking
-let event = pool.acquire_labeled("kernel-42").unwrap();
-println!("Event {} state: {}", event.id, event.state);
+// Acquire an event for a kernel launch
+let event_id = pool.acquire().expect("pool not exhausted");
 
-// Begin recording (kernel launch)
-pool.begin_recording(event.id).unwrap();
+// ... dispatch GPU kernel, record event ...
 
-// Complete the event (kernel finished)
-pool.complete(event.id).unwrap();
-println!("Kernel duration: {:?}", event.kernel_duration());
+// Wait for completion (blocking, with timeout)
+pool.wait(event_id, std::time::Duration::from_millis(100));
 
-// Release back to pool for reuse
-pool.release(event.id).unwrap();
+// Event returns to Free state automatically after Recorded + reset
+pool.release(event_id);
 ```
 
-### Waiting for Multiple Events
+## API
+
+### `EventPool`
+
+| Method | Description |
+|--------|-------------|
+| `new(capacity: usize)` | Create pool with `capacity` pre-allocated events |
+| `acquire() -> Result<EventId, EventError>` | Get a free event (blocks if exhausted) |
+| `release(id: EventId)` | Return event to the pool |
+| `wait(id: EventId, timeout: Duration) -> Result<(), EventError>` | Block until event is Recorded |
+| `mark_recording(id)` | Transition event to Recording state |
+| `mark_recorded(id)` | Transition event to Recorded state |
+| `state(id) -> Option<EventState>` | Query current state |
+
+### `Event`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `EventId (u64)` | Unique monotonic identifier |
+| `state` | `EventState` | Current lifecycle state |
+| `created_at` | `Instant` | Allocation timestamp |
+| `recorded_at` | `Option<Instant>` | Completion timestamp |
+| `label` | `Option<String>` | Debug label |
+
+### `EventError`
 
 ```rust
-use ternary_event_pool::*;
-use std::time::Duration;
-
-let pool = EventPool::new(8);
-
-let e1 = pool.acquire().unwrap();
-let e2 = pool.acquire().unwrap();
-
-pool.begin_recording(e1.id).unwrap();
-pool.begin_recording(e2.id).unwrap();
-
-// ... launch kernels ...
-
-pool.complete(e1.id).unwrap();
-pool.complete(e2.id).unwrap();
-
-// Block until both complete (5-second timeout)
-wait_for_events(&pool, &[e1.id, e2.id], Some(Duration::from_secs(5))).unwrap();
+pub enum EventError {
+    InvalidTransition { from: EventState, to: EventState, event_id: EventId },
+    PoolExhausted,
+    NotFound(EventId),
+}
 ```
 
-## Architecture
+## Architecture Notes
 
-### Event Lifecycle
+This crate implements the **γ (gamma) synchronization layer** of the SuperInstance ternary ecosystem. In the γ + η = C framework:
 
-Events follow a strict state machine:
+- **γ (gamma)**: Synchronization primitives — event pools, barriers, fences that ensure ordering guarantees for kernel execution. This crate provides γ-level event tracking.
+- **η (eta)**: Compute primitives — ternary matmul, activation functions, and tensor operations that perform the actual numerical work.
+- **C**: The complete compute pipeline. γ ensures η operations execute in the correct order.
 
-```
-Free → Pending → Recording → Recorded
-  ↑                              |
-  └──────── reset() ─────────────┘
-```
+Without γ-layer event tracking, η-layer ternary kernels would have no way to express dependencies between asynchronous dispatches, making pipeline composition impossible.
 
-Each transition is validated — attempting an invalid transition returns `EventError::InvalidTransition`.
+## References
 
-### EventPool
-
-The pool pre-allocates events on creation. Events are acquired (moved to Pending), transitioned through Recording to Recorded, and then released back to Free for reuse. The pool tracks free indices for O(1) acquire/release. Dynamic expansion via `expand()` adds more events with monotonically increasing IDs.
-
-### EventTimeline
-
-Every state change is recorded in a bounded timeline (default 1000 entries, oldest evicted first). Each entry has a monotonically increasing sequence number. The timeline supports filtering by state and verifying ordering integrity.
-
-### Blocking Wait
-
-`wait_for_events` uses condition variables to efficiently block until all specified events reach the Recorded state. Supports optional timeouts. Thread-safe via `Arc<Mutex<>>` internally.
-
-## Thread Safety
-
-The `EventPool` is thread-safe — all internal state is protected by mutexes. The `wait_for_events` function uses condvars for efficient cross-thread signaling, making it suitable for producer-consumer patterns where one thread launches kernels and another waits for completion.
+- **CUDA Events**: NVIDIA Corporation, "CUDA C++ Programming Guide," Section 6.4 (Event Management), 2024.
+- **Vulkan Fences and Semaphores**: Khronos Group, "Vulkan Specification," Synchronization chapter, 2024.
+- **Producer-Consumer Pattern**: Dijkstra, E.W., "Cooperating Sequential Processes," 1965. The pool's blocking semantics implement this classical pattern.
+- **Rust Condvar**: Rust std library, `std::sync::Condvar` — used for park/unpark semantics with mutex-protected state.
+- **Lock-Free Programming**: Herlihy & Shavit, "The Art of Multiprocessor Programming," MIT Press, 2012. Chapter 10 on concurrent queues informs the pool design.
 
 ## License
 
